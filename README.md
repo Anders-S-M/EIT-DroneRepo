@@ -4,4 +4,4 @@ After building and sourcing the packages you can run the relevant nodes.
 
 Put the offboard2csv.txt code into the offboard.py script to collect data while landing.
 
-See logs.txt for the raw log data we collected while landing, the ground truth location for the marker is (-2.5859,0.0416,0.248), the yaw column is the yaw error.
+See log.txt for the raw log data we collected while doing test landings, the ground truth location for the marker is (-2.5859,0.0416,0.248), the yaw column is the yaw error.
