@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+offboard_ctrl.py: Controlling the drone via a state machine
+Anders Schack Madsen built on code provided by Erik
+"""
+
+###############################################
+# Standard Imports                            #
+###############################################
+import time
+import math
+import numpy as np  # Tilføjet til matrixberegninger
+
+###############################################
+# ROS Imports                                 #
+###############################################
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import ReliabilityPolicy, QoSProfile
+
+import csv
+
+###############################################
+# ROS Topic messages                          #
+###############################################
+from geometry_msgs.msg import PoseStamped, Point
+from std_msgs.msg import Float32, Bool
+
+###############################################
+# Offboard Control class                      #
+###############################################
+class OffboardControl(Node):
+
+    def __init__(self):
+        super().__init__('offboard_ctrl')
+
+        ##### Publisher and subscriber initializations
+
+        # Publisher to flight controller to control drone position
+        self.publisher_ = self.create_publisher(
+            PoseStamped, 
+            '/mavros/setpoint_position/local',
+            QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
+        )
+
+        # Subscriber to get the drone's current position from flight controller or optitrack
+        self.subscription = self.create_subscription(
+            PoseStamped,
+            '/mavros/local_position/pose',
+            self.position_callback,
+            QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
+        )
+
+        # Subscriber to get the marker relative position, for pre landing alignment
+        self.subscription_marker = self.create_subscription(
+            Point,
+            '/marker_xy',
+            self.xy_callback,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        )
+
+        # Subscriber to get the aruco marker vector for landing
+        self.subscription_aruco = self.create_subscription(
+            Point,
+            '/aruco_vec',
+            self.aruco_callback,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        )
+
+        # Subscriber to get the aruco marker yaw for landing
+        self.subscription_aruco_yaw = self.create_subscription(
+            Float32,
+            '/aruco_yaw',
+            self.aruco_yaw_callback,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        )
+
+        # Publisher to control the box state
+        self.box_publisher = self.create_publisher(
+            Bool,
+            '/box_bool',
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        )
+
+        ##### Create timer whose callback also functions as the state machine
+
+        # Timer to periodically send setpoints
+        self.timer_period = 0.1  # seconds
+        self.timer = self.create_timer(self.timer_period, self.timer_callback)
+
+        ##### Initialize variables
+
+        # Variables
+        self.i = 0
+        self.msg = PoseStamped()
+        self.msg.header.frame_id = "map"
+        self.radius = 2             # Radius of the circle
+        self.explorealtitude = 3.0  # Altitude when flying around exploring
+        self.descendaltitude = 2.0  # Altitude when flying above a secchi marker
+        self.waitforgoal = False    # For when going to a point before switching state
+        self.waitformarker = False  # For when searching for marker
+        self.waitforaruco = False   # For when waiting for the box to open before landing
+        self.state = 0              # For drone state machine
+        self.aruco_vec_time = None  # For ensuring we get the aruco_vector frequently enough to land
+        self.logflag = True
+        self.current_position = None
+        self.drone_yaw = 0.0        # Initialize drone yaw to 0
+        self.aruco_yaw = None
+        self.goal_position = None
+        self.marker_xy = None
+        self.aruco_vector = None
+
+#############################################################################################################
+#############       State machine in timer callback           ###############################################
+#############################################################################################################
+
+    def timer_callback(self):
+        """Send target position setpoints based on the current state."""
+        # Check if current position is available
+        if self.current_position is None:
+            self.get_logger().info('Waiting for current position...')
+            return
+
+        # Set goal position based on state
+        if self.state == 0:     # Takeoff and wait till height reached
+            if self.logflag:
+                self.get_logger().info('Takeoff!')
+                self.logflag = False
+
+            #open the box so the pilot can takeoff and put the drone in offboard
+            self.openbox()
+
+            x = 0.0
+            y = 0.0
+            z = self.explorealtitude
+            self.goal_position = (x, y, z)
+            self.waitforgoal = True
+
+        elif self.state == 1:   # Go around circular path to simulate taking pictures
+            # Calculate circular path mathematically
+            if self.logflag:
+                self.get_logger().info('Circle!')
+                self.logflag = False
+            
+            self.closebox()
+
+            x = self.radius * math.cos(self.i * 2 * math.pi / 360)
+            y = self.radius * math.sin(self.i * 2 * math.pi / 360)
+            z = self.explorealtitude
+            self.goal_position = (x, y, z)
+
+            # Calculate yaw (heading) and convert to quaternion
+            self.drone_yaw = (self.i + 90) * 2 * math.pi / 360
+            q = self.yaw_to_quaternion(self.drone_yaw)
+
+            # Update orientation
+            self.msg.pose.orientation.x = q[0]
+            self.msg.pose.orientation.y = q[1]
+            self.msg.pose.orientation.z = q[2]
+            self.msg.pose.orientation.w = q[3]
+
+            # Counter for complete rotation, when done wait for reaching point and go to next state
+            if self.i >= 360:
+                self.waitforgoal = True
+            else:
+                self.i += 1
+
+        elif self.state == 2: # Go around again this time look for marker to land on
+            # Calculate circular path mathematically
+            if self.logflag:
+                self.get_logger().info('Find marker!')
+                self.logflag = False
+
+            self.waitformarker = True
+            x = self.radius * math.cos(self.i * 2 * math.pi / 360)
+            y = self.radius * math.sin(self.i * 2 * math.pi / 360)
+            z = self.explorealtitude
+            self.goal_position = (x, y, z)
+
+            # Drone yaw (heading) always forward when looking for marker convert to quaternion
+            self.drone_yaw = 0
+            q = self.yaw_to_quaternion(self.drone_yaw)
+
+            # Update orientation
+            self.msg.pose.orientation.x = q[0]
+            self.msg.pose.orientation.y = q[1]
+            self.msg.pose.orientation.z = q[2]
+            self.msg.pose.orientation.w = q[3]
+
+            # Counter for complete rotation keep going if no marker is found
+            if self.i >= 360:
+                self.i = 0
+            else:
+                self.i += 1
+
+        elif self.state == 3:       # Go above marker using simple SMC scheme for xy position and yaw 
+            if self.logflag:
+                self.get_logger().info('Go to marker!')
+                self.logflag = False
+
+            current_x, current_y, _ = self.current_position
+            marker_x, marker_y, _ = self.marker_xy
+
+            if abs(marker_x) < 20 and abs(marker_y) < 20:   # If we are within the center of the marker
+                self.waitforaruco = True                    # Wait for Aruco marker
+                self.openbox()                              # Open the box
+                x = current_x
+                y = current_y
+                z = self.explorealtitude
+                self.goal_position = (x, y, z)
+                return                                      # Don't do anything else
+            else:
+                self.waitforaruco = False                   # If not yet aligned or get unaligned go out of waiting for aruco mode
+
+            # SMC controller xy, how aggressive is the SMC controller, move current position in meters
+            smc_gain = -0.08 
+
+            if marker_y < 5:
+                current_x += smc_gain
+            elif marker_y > -5:
+                current_x -= smc_gain
+
+            if marker_x < 5:
+                current_y -= smc_gain
+            elif marker_x > -5:
+                current_y += smc_gain
+
+            # Set new goal position based on the current values +- smc gain
+            x = current_x
+            y = current_y
+            z = self.explorealtitude
+            self.goal_position = (x, y, z)
+
+        elif self.state == 4: # Align with marker
+            if self.logflag:
+                self.get_logger().info('Align with marker!')
+                self.logflag = False
+
+            current_x, current_y, _ = self.current_position
+            arucoyaw = self.aruco_yaw
+            droneyaw = self.drone_yaw
+            
+            # Yaw align
+
+            if abs(arucoyaw) < 2:   # If we are within the center of the marker go to next state
+                self.waitforaruco = True
+
+            # Otherwise SMC yaw control
+            smc_yaw_gain = 0.1
+
+            if arucoyaw < 1:
+                droneyaw += smc_yaw_gain
+            elif arucoyaw > 1:
+                droneyaw -= smc_yaw_gain
+            else:
+                droneyaw = droneyaw
+
+
+            # Update drone yaw
+            self.drone_yaw = droneyaw
+            q = self.yaw_to_quaternion(droneyaw)
+
+            self.msg.pose.orientation.x = q[0]
+            self.msg.pose.orientation.y = q[1]
+            self.msg.pose.orientation.z = q[2]
+            self.msg.pose.orientation.w = q[3]
+
+            x = current_x
+            y = current_y
+            z = self.explorealtitude
+            self.goal_position = (x, y, z)
+
+        elif self.state == 5:  # Smart Landing with position correction during descent
+            if self.logflag:
+                self.get_logger().info('Descending towards marker...')
+                self.logflag = False
+                with open('position_log.csv', mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow(['current_x', 'current_y', 'current_z','yaw'])
+
+            current_x, current_y, current_z = self.current_position
+            droneyaw = self.drone_yaw
+
+            # log positions when landing
+            with open('position_log.csv', mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([current_x, current_y, current_z, self.aruco_yaw])
+
+            # Initialize the new goal position
+            x = current_x
+            y = current_y
+            z = current_z
+
+            aruco_x, aruco_y, aruco_z = self.aruco_vector
+
+            # Parameters for descent
+            kp = 0.3                # Proportional gain for position correction
+            max_adjust = 0.5      # Maximum position adjustment per update
+            z_rate = 0.15 * z        # Meters per update; descent rate
+            land_height = 0.5     # Meters; final landing altitude
+
+            # Adjust y position (drone's right position) based on aruco_x
+            error_y = aruco_x  # Positive if marker is to the right
+            adjust_y = max(-max_adjust, min(max_adjust, kp * error_y))
+
+            # Adjust x position (drone's forward position) based on aruco_y
+            error_x = aruco_y  # Positive if marker is below center
+            adjust_x = max(-max_adjust, min(max_adjust, kp * error_x))
+
+            # Convert local adjustments (adjust_x, adjust_y) to global coordinates
+            cos_yaw = math.cos(droneyaw)
+            sin_yaw = math.sin(droneyaw)
+
+            # Apply rotation transformation
+            global_adjust_x = adjust_x * cos_yaw - adjust_y * sin_yaw
+            global_adjust_y = adjust_x * sin_yaw + adjust_y * cos_yaw
+
+            # Apply corrections in the global frame
+            x = current_x - global_adjust_x  # Subtract because positive adjust_x means drone moves forward
+            y = current_y - global_adjust_y  # Subtract because positive adjust_y means drone moves right
+
+            # Descend faster when error is low, via errorfactor
+            errorfactor = 1 / (abs(error_x) * abs(error_y))
+            errorfactor = min(1, errorfactor)
+
+            # Decrease altitude
+            z -= z_rate * errorfactor
+
+            # Final landing check
+            if z <= land_height or aruco_z <= land_height:
+                self.get_logger().info("Land height!")
+                z = land_height - 0.1
+                self.state += 1
+                self.logflag = True
+
+            # Hold current yaw without further correction
+            q = self.yaw_to_quaternion(self.drone_yaw)
+
+            # Update orientation and position
+            self.msg.pose.orientation.x = q[0]
+            self.msg.pose.orientation.y = q[1]
+            self.msg.pose.orientation.z = q[2]
+            self.msg.pose.orientation.w = q[3]
+
+            self.goal_position = (x, y, z)
+
+        else: # Completely land when too close to do anymore adjustments
+            if self.logflag:
+                self.get_logger().info('Landing!!!')
+                self.logflag = False
+            
+            x, y, z = self.current_position
+
+            # log positions when landing
+            with open('position_log.csv', mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([x, y, z, self.aruco_yaw])
+            
+            if z < 0.25: 
+                self.get_logger().info('Offboard script done')
+                self.closebox()
+            
+            z = 0.0
+            self.goal_position = (x, y, z)
+
+        # Update position
+        self.msg.pose.position.x = x
+        self.msg.pose.position.y = y
+        self.msg.pose.position.z = z
+
+        # Publish the goal position
+        self.publisher_.publish(self.msg)
+        #self.get_logger().info(f'Publishing goal position: X: {x:.2f}, Y: {y:.2f}, Z: {z:.2f}')
+
+#############################################################################################################
+#########           Topic related callback functions                #########################################
+#############################################################################################################
+
+    def position_callback(self, msg):
+        """Callback to update the current position of the drone."""
+        self.current_position = (
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        )
+
+        # Extract drone's yaw from the orientation quaternion
+        qx = msg.pose.orientation.x
+        qy = msg.pose.orientation.y
+        qz = msg.pose.orientation.z
+        qw = msg.pose.orientation.w
+
+        # Convert quaternion to yaw
+        self.drone_yaw = self.quaternion_to_yaw(qx, qy, qz, qw)
+
+        # Check if the drone has reached the goal position
+        if self.goal_position is not None and self.has_reached_goal():
+            #self.get_logger().info(f'Goal reached at position: {self.current_position}')
+            if self.waitforgoal == True:
+                # if we were waiting for the drone to reach a goal at the end of a state and does, reset counter, go to next state
+                self.i = 0
+                self.waitforgoal = False 
+                self.state += 1 
+                self.get_logger().info(f'Next state: {self.state}')
+                self.logflag = True
+
+    def xy_callback(self, msg):
+        """Callback to update the marker_xy."""
+        # If we were waiting for marker go to the next state as we found it.
+        if self.waitformarker == True:
+            self.waitformarker = False
+            self.state += 1
+            self.get_logger().info(f'Next state: {self.state}')
+            self.logflag = True
+
+        # Update the variable
+        self.marker_xy = (
+            msg.x,
+            msg.y,
+            msg.z
+        )
+
+    def aruco_callback(self, msg):
+        """Callback to update the aruco_vector."""
+        # If we were waiting for a aruco marker go to the next state as we found it.
+        if self.waitforaruco == True and self.aruco_yaw is not None:
+            self.waitforaruco = False
+            self.state += 1
+            self.get_logger().info(f'Next state: {self.state}')
+            self.logflag = True
+
+        # Update the variable
+        self.aruco_vector = (
+            msg.x,
+            msg.y,
+            msg.z
+        )
+
+    def aruco_yaw_callback(self, msg):
+        """Callback to update the yaw."""
+        # Update the variable
+        self.aruco_yaw = float(msg.data)
+
+#############################################################################################################
+#########           Quality of life  functions                ###############################################
+#############################################################################################################
+
+    def has_reached_goal(self):
+        """Check if the current position is close enough to the goal."""
+        tolerance = 0.2  # Allowable deviation in meters
+        goal_x, goal_y, goal_z = self.goal_position
+        current_x, current_y, current_z = self.current_position
+
+        distance = math.sqrt(
+            (goal_x - current_x) ** 2 +
+            (goal_y - current_y) ** 2 +
+            (goal_z - current_z) ** 2
+        )
+        return distance < tolerance
+
+    def yaw_to_quaternion(self, yaw):
+        """Convert yaw angle to quaternion."""
+        qx = 0.0
+        qy = 0.0
+        qz = math.sin(yaw / 2)
+        qw = math.cos(yaw / 2)
+        return (qx, qy, qz, qw)
+
+    def quaternion_to_yaw(self, x, y, z, w):
+        """Convert quaternion to yaw angle."""
+        # yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        return yaw
+
+    def openbox(self):
+        """Publish a True message to /box_bool to open the box."""
+        msg = Bool()
+        msg.data = True
+        self.box_publisher.publish(msg)
+
+    def closebox(self):
+        """Publish a False message to /box_bool to close the box."""
+        msg = Bool()
+        msg.data = False
+        self.box_publisher.publish(msg)
+
+#############  Just the main       #########################################################################
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    offb_ctrl = OffboardControl()
+
+    try:
+        rclpy.spin(offb_ctrl)
+    except KeyboardInterrupt:
+        offb_ctrl.get_logger().info('Shutting down node...')
+    finally:
+        offb_ctrl.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+
